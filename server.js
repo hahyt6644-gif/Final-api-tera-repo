@@ -1,152 +1,160 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Optimized Scroll Function
-async function autoScroll(page) {
-    await page.evaluate(async () => {
-        await new Promise((resolve) => {
-            let totalHeight = 0;
-            let distance = 200; 
-            let timer = setInterval(() => {
-                let scrollHeight = document.body.scrollHeight;
-                window.scrollBy(0, distance);
-                totalHeight += distance;
-                
-                // Stop if bottom reached or 3000px scrolled
-                if (totalHeight >= scrollHeight || totalHeight > 3000) {
-                    clearInterval(timer);
-                    resolve();
-                }
-            }, 100);
-        });
+async function quickScroll(page) {
+    await page.evaluate(() => {
+        window.scrollBy(0, 800);
     });
 }
 
 app.get('/trace', async (req, res) => {
     const targetUrl = req.query.url;
-    // Set wait time just as a fallback (max 45s)
-    const waitTimeSec = Math.min(parseInt(req.query.t) || 15, 45);
+    const waitTimeMs = Math.min((parseInt(req.query.t) || 3) * 1000, 5000);
 
-    if (!targetUrl) return res.status(400).json({ error: "No URL provided" });
+    if (!targetUrl) {
+        return res.status(400).json({ error: 'No URL provided' });
+    }
+
+    const startTime = Date.now(); // ⏱ START TIMER
 
     let browser;
-    let responseSent = false; // Flag to prevent double sending
+    let responseSent = false;
 
     try {
         browser = await puppeteer.launch({
             executablePath: '/usr/bin/google-chrome',
-            headless: "new",
+            headless: 'new',
             args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-sync',
+                '--metrics-recording-only',
+                '--mute-audio',
+                '--no-first-run'
             ]
         });
 
         const page = await browser.newPage();
 
-        // Enable Request Interception
+        // SPEED: block heavy resources
         await page.setRequestInterception(true);
-
-        page.on('request', (req) => {
-            // Allow all requests to pass through
-            req.continue(); 
+        page.on('request', req => {
+            const type = req.resourceType();
+            if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+                req.abort();
+            } else {
+                req.continue();
+            }
         });
 
-        // LISTENER: Jaise hi response aaye, check karo
-        page.on('response', async (response) => {
+        await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
+        );
+
+        const responseHandler = async (response) => {
             const reqUrl = response.url();
-            
-            // Yaha hum check kar rahe hain ki URL me "workers.dev" aur "stream" hai ya nahi
-            // Tumhare example ke hisab se: stream-api.share...workers.dev
-            if (reqUrl.includes('workers.dev') && (reqUrl.includes('stream') || reqUrl.includes('share'))) {
-                
-                // Agar response pehle hi bhej chuke hain to ignore karo
+
+            if (
+                /workers\.dev|cloudflareworkers\.com/.test(reqUrl) &&
+                /(stream|share)/i.test(reqUrl)
+            ) {
                 if (responseSent) return;
+                responseSent = true;
+
+                const endTime = Date.now(); // ⏱ END TIMER
 
                 try {
-                    const method = response.request().method();
+                    const request = response.request();
                     const status = response.status();
-                    let data;
-                    
-                    // Try to parse JSON
+                    const headers = response.headers();
+
+                    let body;
                     try {
-                        data = await response.json();
-                    } catch (e) {
-                        // Agar JSON nahi hai to text lelo
-                        // data = await response.text();
-                        data = "[Not JSON Data]";
+                        if (headers['content-type']?.includes('application/json')) {
+                            body = await response.json();
+                        } else {
+                            body = await response.text();
+                        }
+                    } catch {
+                        body = '[Unable to read response body]';
                     }
 
-                    // SUCCESS: Response mil gaya!
-                    responseSent = true;
-                    
                     res.json({
                         success: true,
-                        target_found: true,
-                        captured_api: {
+                        time_taken_ms: endTime - startTime,
+                        time_taken_sec: ((endTime - startTime) / 1000).toFixed(2),
+                        request: {
                             url: reqUrl,
-                            method: method,
-                            status: status,
-                            data: data
+                            method: request.method(),
+                            headers: request.headers(),
+                            postData: request.postData() || null
+                        },
+                        response: {
+                            status,
+                            headers,
+                            body
                         }
                     });
 
-                    // Kaam ho gaya, browser close karo fast
-                    await browser.close();
+                    page.off('response', responseHandler);
+
+                    setTimeout(async () => {
+                        try { await page.close(); } catch {}
+                        try { await browser.close(); } catch {}
+                    }, 50);
 
                 } catch (err) {
-                    console.error("Error parsing response:", err);
+                    console.error('Capture error:', err);
                 }
             }
+        };
+
+        page.on('response', responseHandler);
+
+        await page.goto(targetUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 15000
         });
-        
 
-        // Page load start
-        try {
-            await page.goto(targetUrl, { 
-                waitUntil: 'domcontentloaded', 
-                timeout: 45000 
-            });
-        } catch (e) {
-            // Agar page load hone se pehle hi API mil gayi aur browser close ho gaya, 
-            // to ye error throw karega "Navigation failed because browser has disconnected!"
-            // Isliye hum is error ko ignore karenge agar responseSent true hai.
-            if (responseSent) return;
-        }
+        await quickScroll(page);
 
-        // Agar abhi tak nahi mila, to thoda scroll karke dekhte hain
+        await new Promise(r => setTimeout(r, waitTimeMs));
+
         if (!responseSent) {
-            await autoScroll(page);
-        }
+            const endTime = Date.now();
 
-        // Agar scroll ke baad bhi turant nahi mila, to thoda wait karte hain (User defined time)
-        if (!responseSent) {
-             await new Promise(r => setTimeout(r, waitTimeSec * 1000));
-        }
-
-        // Agar time khatam hone ke baad bhi nahi mila
-        if (!responseSent) {
             responseSent = true;
-            await browser.close();
-            res.json({ 
-                success: false, 
-                message: "Target API request not found within time limit." 
+            res.json({
+                success: false,
+                message: 'API not found within fast timeout',
+                time_taken_ms: endTime - startTime,
+                time_taken_sec: ((endTime - startTime) / 1000).toFixed(2)
             });
+
+            await page.close().catch(() => {});
+            await browser.close().catch(() => {});
         }
 
     } catch (err) {
-        // Agar response bhej chuke hain to error ignore karo
         if (responseSent) return;
-        
-        console.error(err);
-        if (browser) await browser.close();
-        res.status(500).json({ success: false, error: err.message });
+        try { await browser?.close(); } catch {}
+
+        res.status(500).json({
+            success: false,
+            error: err.message,
+            time_taken_ms: Date.now() - startTime,
+            time_taken_sec: ((Date.now() - startTime) / 1000).toFixed(2)
+        });
     }
 });
 
-app.listen(PORT, () => console.log(`API is running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`⚡ Fast API tracer running on port ${PORT}`);
+});
